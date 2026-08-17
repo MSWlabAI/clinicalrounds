@@ -1,0 +1,775 @@
+name: Dave — nightly security
+
+# Dave is the lab's DevSecOps agent. Every night he scans this app for
+# vulnerabilities, proposes the dependency updates that are safe to take, and
+# tells the lab Slack channel whether everything is fine or something needs a
+# human.
+#
+# This workflow ships in the lab template, so every app created from it gets its
+# own Dave with no extra setup.
+#
+# ── Shape of the run ──────────────────────────────────────────────────────
+#   scan     Deterministic. No model, no privileged secrets, read-only token.
+#            npm audit, OSV, cooldown analysis, install-script diff, registry
+#            signatures, workflow hygiene. Produces .dave/out/report.json.
+#   triage   Only when the scan found something NEW. Runs Claude Code headless
+#            against that report to apply the safe fixes; the workflow then
+#            INDEPENDENTLY verifies the result and opens a PR (draft if
+#            verification failed). Never merges.
+#   notify   Always. Posts the verdict to Slack — including the all-clear.
+#
+# ── Why it is split this way ──────────────────────────────────────────────
+# A coding agent in CI that can read secrets, read untrusted text, AND push code
+# is the "lethal trifecta" that makes indirect prompt injection worth attempting.
+# Dave necessarily reads untrusted text — advisory titles, changelogs and package
+# metadata written by whoever published them — so the other two legs are cut:
+#
+#   - the scan job never sees the model token; the triage job never sees Doppler
+#     or deployment credentials;
+#   - the triage checkout uses persist-credentials: false, so the agent has no
+#     usable git credential and cannot push. The workflow pushes afterwards, and
+#     only once scripts/dave-verify.mjs confirms the diff is within policy;
+#   - the agent's tools are allow-listed with no network egress beyond npm, so
+#     there is no channel to exfiltrate what it read;
+#   - nothing is ever auto-merged. A human reviews every change.
+#
+# ── Secrets ───────────────────────────────────────────────────────────────
+#   CLAUDE_CODE_OAUTH_TOKEN  optional. Auth for the headless triage step. Without
+#                            it Dave still scans, reports and files a tracking
+#                            issue — he just won't propose fixes himself.
+#   SLACK_WEBHOOK_URL        optional. Incoming webhook for the lab channel.
+#                            Without it the Slack step logs and moves on.
+#   SYNC_TOKEN               optional. PAT with `repo` scope. PRs opened with the
+#                            default GITHUB_TOKEN do not trigger other workflows,
+#                            so CI won't run on Dave's PR unless this is set —
+#                            the same trade-off as upstream-sync.yml.
+#
+# ── Variables ─────────────────────────────────────────────────────────────
+#   vars.DAVE_SLACK_QUIET_GREEN = 1   suppress the nightly all-clear ping
+#   vars.DAVE_MODEL                   override the triage model (default: opus)
+
+on:
+  schedule:
+    # 06:00 UTC (~01:00 ET / ~02:00 EDT) — well clear of the 13:00 upstream sync
+    # so the two never compete for the same reviewer's attention.
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: What to run
+        type: choice
+        default: full
+        options:
+          - full # scan, then triage + PR if there is anything new
+          - scan-only # scan and report; never invoke the model
+          - selftest # prove the wiring works; change nothing
+      force:
+        description: Triage even if these findings were already reported
+        type: boolean
+        default: false
+
+concurrency:
+  group: dave-nightly
+  cancel-in-progress: false
+
+# Read-only by default; the triage job opts up to exactly what it needs.
+permissions:
+  contents: read
+
+jobs:
+  # ══════════════════════════════════════════════════════════════════════════
+  # 1. SCAN — deterministic, no model, no privileged secrets
+  # ══════════════════════════════════════════════════════════════════════════
+  scan:
+    if: inputs.mode != 'selftest'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    outputs:
+      status: ${{ steps.scan.outputs.status }}
+      fingerprint: ${{ steps.scan.outputs.fingerprint }}
+      severe: ${{ steps.scan.outputs.severe }}
+      already_reported: ${{ steps.dedupe.outputs.already_reported }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          # Full history: gitleaks below scans every commit, not just the tip.
+          # A secret that was committed and later deleted is still leaked, and
+          # is exactly the case a working-tree scan cannot see.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      # `npm audit signatures` can only verify what is actually on disk.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Secret scan (gitleaks)
+        continue-on-error: true
+        env:
+          # Pinned by version AND checksum. This step downloads and executes a
+          # binary in a job that can read the repo, so it gets the same
+          # treatment as any other dependency — an unverified tarball from a
+          # mutable URL is precisely the supply-chain shape Dave exists to
+          # flag. Bump both values together.
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          set -uo pipefail
+          mkdir -p .dave/out
+
+          TARBALL="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          URL="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${TARBALL}"
+
+          if ! curl -sSfL --retry 3 "$URL" -o /tmp/"$TARBALL"; then
+            echo "::warning::gitleaks download failed — secret scanning skipped tonight."
+            exit 0
+          fi
+
+          # Refuse to run a binary we cannot identify. No report file is written
+          # on mismatch, so dave-scan records gitleaks as absent rather than
+          # clean — "we didn't look" must never read as "nothing to see".
+          echo "${GITLEAKS_SHA256}  /tmp/${TARBALL}" | sha256sum -c - || {
+            echo "::error::gitleaks checksum MISMATCH — refusing to execute. Expected ${GITLEAKS_SHA256}."
+            exit 0
+          }
+
+          tar -xzf /tmp/"$TARBALL" -C /tmp gitleaks
+          /tmp/gitleaks version
+
+          # --exit-code 0 so findings do not fail this step: dave-scan.mjs owns
+          # the verdict, and a leak must flow through the normal report path so
+          # it is deduped, fingerprinted and routed to /rotate like any other
+          # finding. `git` scans full history; `detect` is deprecated in 8.19+.
+          /tmp/gitleaks git . \
+            --report-format json \
+            --report-path .dave/out/gitleaks.json \
+            --redact \
+            --exit-code 0 \
+            --no-banner 2> /tmp/gitleaks.err \
+            || echo "::warning::gitleaks did not complete: $(tail -3 /tmp/gitleaks.err 2>/dev/null)"
+
+          echo "findings: $(node -p "try{require('./.dave/out/gitleaks.json').length}catch{'report not written'}")"
+
+      - name: Workflow static analysis (zizmor)
+        continue-on-error: true
+        run: |
+          # Best-effort. zizmor finds template-injection, over-broad permissions
+          # and dangerous triggers in the workflows themselves — the class of bug
+          # behind the 2025–2026 GitHub Actions supply-chain incidents. If it
+          # can't be installed the scan still runs; report.json records which
+          # scanners actually contributed, so a silent gap is visible.
+          mkdir -p .dave/out
+          pipx run zizmor --format json --persona regular .github/workflows \
+            > .dave/out/zizmor.json 2> /tmp/zizmor.err \
+            || echo "::warning::zizmor did not complete: $(tail -3 /tmp/zizmor.err 2>/dev/null)"
+
+      - name: Scan
+        id: scan
+        env:
+          # Read access to the lab template, so a generated app can diff its
+          # security backend against it. The template is private and this job
+          # holds no git credential by design, so without this the app-side
+          # drift check cannot run. GITHUB_TOKEN is NOT a substitute — it only
+          # grants access to the repo running the workflow.
+          #
+          # Read-only use: the scan never pushes. Absent, the check reports
+          # itself as skipped rather than passing.
+          DAVE_UPSTREAM_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          set +e
+          mkdir -p .dave/out
+          node scripts/dave-scan.mjs --out .dave/out
+          CODE=$?
+          set -e
+
+          if [ "$CODE" = "2" ]; then
+            echo "::error::The scan itself failed. Tonight's result is 'unknown', not 'clean'."
+            echo "status=error" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          {
+            echo "status=$(node -p "require('./.dave/out/report.json').status")"
+            echo "fingerprint=$(node -p "require('./.dave/out/report.json').fingerprint")"
+            echo "severe=$(node -p "const c=require('./.dave/out/report.json').counts;(c.critical||0)+(c.high||0)")"
+          } >> "$GITHUB_OUTPUT"
+
+          cat .dave/out/report.md >> "$GITHUB_STEP_SUMMARY"
+
+      # Dave should not re-triage and re-ping every night about a finding a human
+      # already has open in front of them. The fingerprint is embedded in the
+      # body of whatever he opened last time.
+      - name: Have we already reported exactly this?
+        id: dedupe
+        if: steps.scan.outputs.status == 'findings'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          FP: ${{ steps.scan.outputs.fingerprint }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          # Read bodies directly rather than using the search index, which lags
+          # by minutes and would let duplicates through on consecutive runs.
+          MATCHES=0
+          for KIND in pr issue; do
+            BODIES=$(gh "$KIND" list --state open --limit 50 --json body --jq '.[].body' 2>/dev/null || true)
+            if printf '%s' "$BODIES" | grep -qF "dave-fingerprint:${FP}"; then
+              MATCHES=1
+            fi
+          done
+
+          if [ "$FORCE" = "true" ]; then
+            echo "already_reported=false" >> "$GITHUB_OUTPUT"
+          elif [ "$MATCHES" = "1" ]; then
+            echo "These findings are already tracked (fingerprint ${FP})."
+            echo "already_reported=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already_reported=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: dave-report
+          path: .dave/out/
+          retention-days: 30
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 2. TRIAGE — the only job that touches the model, and the only one that writes
+  # ══════════════════════════════════════════════════════════════════════════
+  triage:
+    needs: scan
+    if: >-
+      needs.scan.outputs.status == 'findings' &&
+      needs.scan.outputs.already_reported != 'true' &&
+      inputs.mode != 'scan-only'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    env:
+      # The `secrets` context is not available in a step-level `if:`, so the
+      # presence of the token is resolved once here into a plain boolean.
+      HAS_MODEL_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+      # Security triage is judgement work, and it only runs on nights that
+      # actually have new findings — so it is worth the better model. Set the
+      # DAVE_MODEL repo variable to `sonnet` if the nightly cost becomes real.
+      DAVE_MODEL: ${{ vars.DAVE_MODEL || 'opus' }}
+    outputs:
+      verdict: ${{ steps.result.outputs.verdict }}
+      target_url: ${{ steps.result.outputs.target_url }}
+    steps:
+      # persist-credentials: false is load-bearing. It keeps the push token out
+      # of .git/config while the agent runs, so the agent physically cannot
+      # publish anything. The workflow pushes later, after verification.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dave-report
+          path: .dave/out
+
+      - run: npm ci
+
+      - name: Record the base commit
+        id: base
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Triage with Claude Code
+        if: env.HAS_MODEL_TOKEN == 'true'
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          npm install -g @anthropic-ai/claude-code
+
+          # Tools are allow-listed rather than unrestricted. Dave needs to read
+          # the tree, edit manifests, and run npm/node plus read-only git. He is
+          # given no WebFetch and no WebSearch: he has just read text that an
+          # attacker can influence, and an outbound channel is precisely what
+          # turns that into an exfiltration path.
+          claude -p "$(cat .github/dave-triage-prompt.md)" \
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(npm:*),Bash(npx tsc:*),Bash(node scripts/dave-verify.mjs:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(ls:*),Bash(cat:*),Bash(mkdir:*)" \
+            --max-turns 120 \
+            --model "$DAVE_MODEL" 2>&1 | tee /tmp/dave.log || true
+
+          echo "::group::Dave's log (tail)"; tail -100 /tmp/dave.log || true; echo "::endgroup::"
+
+      - name: Note that triage was skipped for lack of auth
+        if: env.HAS_MODEL_TOKEN != 'true'
+        run: |
+          echo "::warning::CLAUDE_CODE_OAUTH_TOKEN is not set — reporting findings without proposing fixes."
+          mkdir -p .dave/out
+          echo 'Dave has no model credentials in this repo, so no fixes were attempted.' > .dave/out/REMEDIATION.md
+          cp .dave/out/report.md .dave/out/OPEN_ITEMS.md 2>/dev/null || true
+
+      # ── The trust boundary ────────────────────────────────────────────────
+      # Everything below re-derives the truth from the working tree. Nothing the
+      # agent claimed about its own work is taken at face value.
+      - name: Verify the proposed change
+        id: verify
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          set +e
+          : > /tmp/checks.md
+
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "Dave proposed no code changes."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "verdict=no-changes" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          VERDICT=ok
+
+          node scripts/dave-verify.mjs --base "$BASE_SHA" 2>&1 | tee /tmp/verify.log
+          if [ "${PIPESTATUS[0]}" = "0" ]; then
+            echo "- ✅ policy (cooldown, remit, no new deps, install scripts)" >> /tmp/checks.md
+          else
+            VERDICT=blocked
+            echo "- ❌ policy — see the run log" >> /tmp/checks.md
+          fi
+
+          # Installing Dave's proposed change is itself a check, not setup.
+          # node_modules at this point is still the tree from BASE_SHA — the
+          # state BEFORE his edit. If the new manifest does not install and we
+          # carry on regardless, tsc, lint and build all run against the old
+          # tree and report three ✅ for a package.json that cannot be
+          # installed at all. The result would be a non-draft PR whose checks
+          # describe code that was never built.
+          DEPS_OK=1
+          if npm ci > /tmp/install.log 2>&1 || npm install >> /tmp/install.log 2>&1; then
+            echo "- ✅ dependencies install" >> /tmp/checks.md
+          else
+            DEPS_OK=0
+            VERDICT=blocked
+            echo "- ❌ dependencies do NOT install" >> /tmp/checks.md
+            echo "::group::npm install output"; tail -40 /tmp/install.log; echo "::endgroup::"
+          fi
+
+          check() {
+            LOG="/tmp/check-$(echo "$*" | tr -cs 'a-zA-Z0-9' '-').log"
+            if "$@" > "$LOG" 2>&1; then
+              echo "- ✅ $*" >> /tmp/checks.md
+            else
+              VERDICT=blocked
+              echo "- ❌ $*" >> /tmp/checks.md
+              echo "::group::$* output"; tail -40 "$LOG"; echo "::endgroup::"
+            fi
+          }
+
+          if [ "$DEPS_OK" = "1" ]; then
+            check npx tsc --noEmit
+            check npm run lint
+            check npm run build
+          else
+            # Already blocked. Record these as not-run rather than letting the
+            # PR body imply they passed.
+            for SKIPPED in "npx tsc --noEmit" "npm run lint" "npm run build"; do
+              echo "- ⏭️ ${SKIPPED} — SKIPPED, dependencies did not install" >> /tmp/checks.md
+            done
+          fi
+
+          # The whole point was to reduce advisories. Confirm that it did.
+          BEFORE=$(node -p "const c=require('./.dave/out/report.json').counts;(c.critical||0)+(c.high||0)+(c.moderate||0)")
+          AFTER=$(npm audit --json 2>/dev/null | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{const m=JSON.parse(s).metadata.vulnerabilities;console.log((m.critical||0)+(m.high||0)+(m.moderate||0))}catch{console.log(999)}})")
+          if [ "$AFTER" -le "$BEFORE" ]; then
+            echo "- ✅ advisories ${BEFORE} → ${AFTER}" >> /tmp/checks.md
+          else
+            VERDICT=blocked
+            echo "- ❌ advisories got WORSE: ${BEFORE} → ${AFTER}" >> /tmp/checks.md
+          fi
+
+          # ── Re-verify, because the gate above is no longer authoritative ──
+          # Everything from `npm ci` onward runs dependency lifecycle scripts
+          # and project scripts, all of which can write to the checkout AFTER
+          # the policy gate passed. `git add -A` in the next step would then
+          # stage whatever they left behind.
+          #
+          # So the policy check runs a second time, here, with nothing between
+          # it and staging. The first run tells us Dave's PROPOSAL was in
+          # policy; this one tells us the TREE WE ARE ABOUT TO COMMIT still is.
+          #
+          # This does not contain a hostile install script completely — it can
+          # still touch $GITHUB_ENV or $GITHUB_PATH to reach later steps — but
+          # it does close the "mutate the tree after the gate" path, and the
+          # narrowed remit check now also catches files that were created
+          # rather than edited.
+          node scripts/dave-verify.mjs --base "$BASE_SHA" 2>&1 | tee /tmp/verify-post.log
+          if [ "${PIPESTATUS[0]}" = "0" ]; then
+            echo "- ✅ policy re-checked after install" >> /tmp/checks.md
+          else
+            VERDICT=blocked
+            echo "- ❌ policy VIOLATED after install — the tree changed post-gate" >> /tmp/checks.md
+            echo "::group::post-install verify output"; tail -40 /tmp/verify-post.log; echo "::endgroup::"
+          fi
+
+          echo "verdict=$VERDICT" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Open a pull request
+        id: pr
+        if: steps.verify.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PUSH_TOKEN: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+          VERDICT: ${{ steps.verify.outputs.verdict }}
+          FP: ${{ needs.scan.outputs.fingerprint }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -uo pipefail
+          BRANCH="dave/security-$(date -u +%Y%m%d)"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH" 2>/dev/null || git checkout "$BRANCH"
+
+          git add -A
+          git commit \
+            -m "fix(deps): nightly security remediation" \
+            -m "Applied by Dave, the lab's nightly DevSecOps agent, and independently verified against the supply-chain cooldown, the change remit, and a full build."
+
+          git push -f "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${BRANCH}"
+
+          REMEDIATION=$(cat .dave/out/REMEDIATION.md 2>/dev/null || echo "_(not recorded)_")
+          OPEN_ITEMS=$(cat .dave/out/OPEN_ITEMS.md 2>/dev/null || echo "_(none recorded)_")
+          CHECKS=$(cat /tmp/checks.md 2>/dev/null || echo "_(not recorded)_")
+
+          if [ "$VERDICT" = "ok" ]; then
+            DRAFT=""
+            LABEL="dave-security"
+            TITLE="fix(deps): nightly security remediation"
+            HEADER="Dave applied the changes below and every independent check passed. **Review before merging — Dave never auto-merges.**"
+          else
+            DRAFT="--draft"
+            LABEL="needs-human"
+            TITLE="fix(deps): nightly security remediation — ⚠️ needs human"
+            HEADER="Dave proposed the changes below but they **did not pass verification**. Do not merge as-is; treat this as a starting point."
+          fi
+
+          BODY=$(printf '%s\n\n### Independent checks\n%s\n\n### What Dave changed\n%s\n\n### Still needs a human\n%s\n\n---\n_Opened by the nightly `dave-nightly` workflow. Full report in the run artifacts._\n<!-- dave-fingerprint:%s -->\n' \
+            "$HEADER" "$CHECKS" "$REMEDIATION" "$OPEN_ITEMS" "$FP")
+
+          URL=""
+          for attempt in 1 2 3 4 5; do
+            # A fresh push can briefly read back as an empty ref through the API.
+            if URL=$(gh pr create $DRAFT --base "$BASE_BRANCH" --head "$BRANCH" --title "$TITLE" --body "$BODY" 2>/tmp/pr-err); then
+              break
+            fi
+            echo "pr create attempt ${attempt} failed:"; cat /tmp/pr-err; URL=""; sleep 5
+          done
+          if [ -z "$URL" ]; then
+            echo "::error::Could not open the PR."; cat /tmp/pr-err; exit 1
+          fi
+
+          gh label create "$LABEL" --color B60205 --description "Dave, the nightly DevSecOps agent" 2>/dev/null || true
+          gh pr edit "$URL" --add-label "$LABEL" 2>/dev/null || echo "::warning::could not label ${URL}"
+
+          echo "target_url=$URL" >> "$GITHUB_OUTPUT"
+
+      # Findings exist but nothing was safely fixable. That still deserves a
+      # durable record, not just a Slack message that scrolls away.
+      - name: Open or refresh the tracking issue
+        id: issue
+        if: steps.verify.outputs.changed != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          FP: ${{ needs.scan.outputs.fingerprint }}
+        run: |
+          BODY=$(printf 'Dave found security findings he cannot fix inside his remit.\n\n%s\n\n### Notes\n%s\n\n---\n_Filed by the nightly `dave-nightly` workflow._\n<!-- dave-fingerprint:%s -->\n' \
+            "$(cat .dave/out/report.md)" \
+            "$(cat .dave/out/OPEN_ITEMS.md 2>/dev/null || echo '_(none recorded)_')" \
+            "$FP")
+
+          # Issues can be switched off on a repo, and several lab apps have them
+          # off. When that happens `gh issue create` exits non-zero with
+          # "repository has disabled issues", which used to fail this step and
+          # take the whole triage job red — on a night when the SCAN worked
+          # perfectly and Slack had already been notified. A missing filing
+          # cabinet is not a security failure, and reporting it as one trains
+          # people to ignore red Dave runs.
+          #
+          # So: degrade the way the rest of Dave degrades. Warn, put the report
+          # in the job summary so the findings still land somewhere durable for
+          # the retention window, and let notify do its job.
+          set +e
+          gh label create dave-security --color B60205 --description "Dave, the nightly DevSecOps agent" 2>/dev/null
+          EXISTING=$(gh issue list --state open --label dave-security --limit 1 --json number --jq '.[0].number // empty' 2>/dev/null)
+
+          URL=""
+          if [ -n "$EXISTING" ]; then
+            gh issue edit "$EXISTING" --body "$BODY" > /dev/null 2>/tmp/issue-err && \
+              URL=$(gh issue view "$EXISTING" --json url --jq .url 2>/dev/null)
+          else
+            URL=$(gh issue create --title "Dave: security findings needing a human" --label dave-security --body "$BODY" 2>/tmp/issue-err)
+          fi
+
+          if [ -z "$URL" ]; then
+            WHY=$(tail -1 /tmp/issue-err 2>/dev/null || echo "unknown error")
+            echo "::warning::Could not file the tracking issue (${WHY}). The findings are in the job summary and were sent to Slack, but there is no durable record — and because the fingerprint is stored in that issue, these findings will be re-triaged every night until issues are enabled or they are fixed."
+            {
+              echo "### ⚠️ Dave could not file a tracking issue"
+              echo ""
+              echo "\`${WHY}\`"
+              echo ""
+              echo "Findings below. Enable Issues on this repository to get a durable record and nightly de-duplication."
+              echo ""
+              cat .dave/out/report.md
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo "target_url=$URL" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Result
+        id: result
+        if: always()
+        env:
+          VERDICT: ${{ steps.verify.outputs.verdict }}
+          PR_URL: ${{ steps.pr.outputs.target_url }}
+          ISSUE_URL: ${{ steps.issue.outputs.target_url }}
+        run: |
+          echo "verdict=${VERDICT:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "target_url=${PR_URL:-$ISSUE_URL}" >> "$GITHUB_OUTPUT"
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 3. NOTIFY — always, including the all-clear
+  # ══════════════════════════════════════════════════════════════════════════
+  notify:
+    needs: [scan, triage]
+    if: always() && inputs.mode != 'selftest'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # The dashboard reads this workflow's own run history to draw the
+      # timeline. Read-only, and the token never leaves the step.
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        continue-on-error: true
+        with:
+          name: dave-report
+          path: .dave/out
+
+      - name: Post to Slack
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          DAVE_SLACK_QUIET_GREEN: ${{ vars.DAVE_SLACK_QUIET_GREEN }}
+          # ISO day-of-week for the weekly "still here" post when findings are
+          # unchanged. 1 = Monday. Set to 0 to disable the heartbeat entirely.
+          DAVE_HEARTBEAT_DAY: ${{ vars.DAVE_HEARTBEAT_DAY }}
+          DAVE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SCAN_RESULT: ${{ needs.scan.result }}
+          SCAN_STATUS: ${{ needs.scan.outputs.status }}
+          ALREADY_REPORTED: ${{ needs.scan.outputs.already_reported }}
+          TRIAGE_VERDICT: ${{ needs.triage.outputs.verdict }}
+          TARGET_URL: ${{ needs.triage.outputs.target_url }}
+        run: |
+          # Map the job outcomes onto the four things a human might need to know.
+          # Note the ordering: a failed scan reports as an ERROR, never as clean —
+          # "we didn't look" must never be dressed up as "nothing to see".
+          if [ "$SCAN_RESULT" != "success" ]; then
+            STATUS=error
+          elif [ "$SCAN_STATUS" = "clean" ]; then
+            STATUS=clean
+          elif [ "$ALREADY_REPORTED" = "true" ]; then
+            # Unchanged findings normally stay quiet, so the channel is not
+            # re-pinged nightly about a PR someone already has open.
+            #
+            # But total silence is ambiguous, and that ambiguity is the very
+            # thing this agent exists to remove: "nothing new" and "Dave has
+            # been dead for a week" produce an identical empty channel. Dave
+            # went four consecutive nights without posting once, and from the
+            # channel there was no way to tell which of the two it was.
+            #
+            # So once a week he says he is still here. Stateless on purpose —
+            # keyed off the day of week rather than a stored last-posted
+            # timestamp, so there is no state to drift, and the cadence is
+            # predictable enough that a MISSING Monday is itself a signal.
+            HEARTBEAT_DAY="${DAVE_HEARTBEAT_DAY:-1}"   # 1 = Monday, ISO
+            if [ "$(date -u +%u)" = "$HEARTBEAT_DAY" ]; then
+              echo "Findings unchanged, but it is the weekly heartbeat day — posting anyway."
+              STATUS=heartbeat
+            else
+              echo "Findings unchanged since the last report — staying quiet."
+              exit 0
+            fi
+          elif [ "$TRIAGE_VERDICT" = "blocked" ]; then
+            STATUS=blocked
+          else
+            STATUS=findings
+          fi
+
+          ARGS=(--status "$STATUS" --report .dave/out/report.json)
+          [ -n "$TARGET_URL" ] && ARGS+=(--pr-url "$TARGET_URL")
+          node scripts/dave-slack.mjs "${ARGS[@]}"
+
+      # The dashboard answers "what IS", which Slack structurally cannot: a feed
+      # you were not watching is indistinguishable from a feed with nothing in
+      # it. Rendering it here — rather than only as a local npm script, which is
+      # what it was until now — means every run leaves a readable page behind
+      # whether or not a webhook is configured.
+      #
+      # continue-on-error on purpose: a dashboard that fails to render must
+      # never turn a successful scan red. The scan is the product.
+      - name: Render the dashboard
+        continue-on-error: true
+        env:
+          # Run history comes from the Actions API; without it the page still
+          # renders and says the history is unavailable, rather than showing an
+          # empty timeline that would read as "he never ran".
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          if [ ! -f .dave/out/report.json ]; then
+            echo "::warning::no report.json — nothing to render."
+            exit 0
+          fi
+          node scripts/dave-dashboard.mjs --out .dave/out/dashboard.html
+          {
+            echo '### Dashboard'
+            echo
+            echo 'Rendered to the `dave-dashboard` artifact on this run. Download it and open in a browser.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: hashFiles('.dave/out/dashboard.html') != ''
+        with:
+          name: dave-dashboard
+          path: .dave/out/dashboard.html
+          retention-days: 30
+
+      # Slack is a feed; it tells you what happened, never what IS. This posts
+      # the same verdict to the lab's DevOps board so fleet health has one
+      # place to be read. Entirely optional: without DAVE_REPORT_URL the step
+      # is skipped and nothing else changes.
+      #
+      # Deliberately `continue-on-error` and last: a dashboard being
+      # unreachable must never turn a successful scan red. The scan is the
+      # product; this is a mirror of it.
+      - name: Report to the DevOps board
+        if: ${{ vars.DAVE_REPORT_URL != '' }}
+        continue-on-error: true
+        env:
+          DAVE_REPORT_URL: ${{ vars.DAVE_REPORT_URL }}
+          DAVE_REPORT_TOKEN: ${{ secrets.DAVE_REPORT_TOKEN }}
+          DAVE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TARGET_URL: ${{ needs.triage.outputs.target_url }}
+          # report.json takes `repo` from GITHUB_REPOSITORY at SCAN time. Passing
+          # it explicitly here too means the board key never depends on that
+          # having been set — a null repo would be rejected by the endpoint's
+          # schema and the failure would read as an opaque 400.
+          REPO_SLUG: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          if [ ! -f .dave/out/report.json ]; then
+            echo "::warning::no report.json — nothing to report to the board."
+            exit 0
+          fi
+          if [ -z "${DAVE_REPORT_TOKEN:-}" ]; then
+            echo "::warning::DAVE_REPORT_URL is set but DAVE_REPORT_TOKEN is not — skipping."
+            exit 0
+          fi
+
+          # Send a SUMMARY, not the whole report. Only the fields the board
+          # renders, and only the findings a human is meant to act on, so the
+          # payload stays small and the endpoint's schema stays strict.
+          PAYLOAD=$(node -e "
+            const r = require('./.dave/out/report.json');
+            const findings = (r.findings || [])
+              .filter(f => f.severity === 'critical' || f.severity === 'high')
+              .slice(0, 25)
+              .map(f => ({
+                id: String(f.id), severity: f.severity,
+                title: String(f.title || '').slice(0, 500),
+                detail: f.detail ? String(f.detail).slice(0, 4000) : undefined,
+                remediations: Array.isArray(f.remediationCommands)
+                  ? f.remediationCommands.slice(0, 6).map(String)
+                  : undefined,
+              }));
+            const out = {
+              repo: r.repo || process.env.REPO_SLUG, status: r.status, counts: r.counts,
+              degraded: r.degraded || [], scanners: r.scanners || [],
+              fingerprint: r.fingerprint, findings,
+            };
+            if (process.env.DAVE_RUN_URL) out.runUrl = process.env.DAVE_RUN_URL;
+            if (process.env.TARGET_URL) out.trackingUrl = process.env.TARGET_URL;
+            process.stdout.write(JSON.stringify(out));
+          ")
+
+          attempt=0
+          CODE=000
+          while [ "$attempt" -le 2 ]; do
+            CODE=$(printf '%s' "$PAYLOAD" | curl -sS -o /tmp/dave-report-resp.json -w '%{http_code}' \
+              -X POST "$DAVE_REPORT_URL" \
+              -H 'content-type: application/json' \
+              -H "x-dave-token: ${DAVE_REPORT_TOKEN}" \
+              --max-time 20 --data-binary @- || echo 000)
+            case "$CODE" in
+              200|404) break ;;
+              429|5*|000)
+                attempt=$((attempt + 1))
+                sleep $((2 + attempt * 2 + RANDOM % 3))
+                ;;
+              *) break ;;
+            esac
+          done
+
+          case "$CODE" in
+            200) echo "Board updated." ;;
+            # A repo with no board is normal, not a failure.
+            404) echo "No board is tracking this repo — nothing to update." ;;
+            *)   echo "::warning::Board report failed (HTTP $CODE): $(head -c 300 /tmp/dave-report-resp.json 2>/dev/null)" ;;
+          esac
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 4. SELFTEST — on demand: prove the whole thing still works
+  # ══════════════════════════════════════════════════════════════════════════
+  selftest:
+    if: inputs.mode == 'selftest'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+      - name: Run Dave's self-test
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          # --post sends one real message, so the Slack path is proven end to end
+          # rather than just the payload shape.
+          node scripts/dave-selftest.mjs --post | tee /tmp/selftest.log
+          { echo '### Dave self-test'; echo '```'; cat /tmp/selftest.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
