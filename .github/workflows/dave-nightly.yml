@@ -47,6 +47,8 @@ name: Dave — nightly security
 # ── Variables ─────────────────────────────────────────────────────────────
 #   vars.DAVE_SLACK_QUIET_GREEN = 1   suppress the nightly all-clear ping
 #   vars.DAVE_MODEL                   override the triage model (default: opus)
+#   vars.DAVE_LEVEL                   off | watch | scan | full
+#                                     unset = scan. full is production only.
 
 on:
   schedule:
@@ -77,11 +79,34 @@ permissions:
   contents: read
 
 jobs:
+  level:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      dave_level: ${{ steps.pick.outputs.level }}
+    steps:
+      - id: pick
+        env:
+          RAW: ${{ vars.DAVE_LEVEL }}
+        run: |
+          set -euo pipefail
+          case "${RAW:-}" in
+            off|watch|scan|full) L="$RAW" ;;
+            "") L=scan ;;
+            *)
+              echo "::warning::DAVE_LEVEL='${RAW}' is not off|watch|scan|full — treating as scan"
+              L=scan
+              ;;
+          esac
+          echo "level=$L" >> "$GITHUB_OUTPUT"
+          echo "Dave level: $L"
+
   # ══════════════════════════════════════════════════════════════════════════
   # 1. SCAN — deterministic, no model, no privileged secrets
   # ══════════════════════════════════════════════════════════════════════════
   scan:
-    if: inputs.mode != 'selftest'
+    needs: [level]
+    if: inputs.mode != 'selftest' && (needs.level.outputs.dave_level == 'scan' || needs.level.outputs.dave_level == 'full')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -246,8 +271,9 @@ jobs:
   # 2. TRIAGE — the only job that touches the model, and the only one that writes
   # ══════════════════════════════════════════════════════════════════════════
   triage:
-    needs: scan
+    needs: [scan, level]
     if: >-
+      needs.level.outputs.dave_level == 'full' &&
       needs.scan.outputs.status == 'findings' &&
       needs.scan.outputs.already_reported != 'true' &&
       inputs.mode != 'scan-only'
@@ -556,8 +582,8 @@ jobs:
   # 3. NOTIFY — always, including the all-clear
   # ══════════════════════════════════════════════════════════════════════════
   notify:
-    needs: [scan, triage]
-    if: always() && inputs.mode != 'selftest'
+    needs: [scan, triage, level]
+    if: always() && inputs.mode != 'selftest' && (needs.level.outputs.dave_level == 'scan' || needs.level.outputs.dave_level == 'full')
     runs-on: ubuntu-latest
     permissions:
       contents: read
