@@ -33,6 +33,10 @@ import { runIntake, runSpecialists, runSpecialistsStreaming, runCrossConsult, ru
 describe('orchestrator', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // Keep the ParseStage LLM structurer disabled so existing tests
+    // continue to assert on the single intake LLM call. Tests that want
+    // to exercise the structurer set ANTHROPIC_API_KEY explicitly.
+    delete process.env.ANTHROPIC_API_KEY;
   });
 
   describe('runIntake', () => {

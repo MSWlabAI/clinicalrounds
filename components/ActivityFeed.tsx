@@ -115,6 +115,9 @@ export function ActivityFeed({ statuses, searchActivities, calculationActivities
     }
 
     if (newEvents.length > 0) {
+      // Idempotent thanks to seenRef-based dedup — each newEvent is appended
+      // at most once across the component's lifetime, so this won't loop.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setEvents(prev => [...prev, ...newEvents].slice(-MAX_EVENTS));
     }
   }, [statuses, searchActivities, calculationActivities, specialistAnalyses]);

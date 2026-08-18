@@ -14,9 +14,10 @@ export function PasscodeGate({ children }: { children: React.ReactNode }) {
   const inputRefs = useRef<(HTMLInputElement | null)[]>([]);
 
   useEffect(() => {
-    if (sessionStorage.getItem(STORAGE_KEY) === 'true') {
-      setAuthenticated(true);
-    }
+    // sessionStorage isn't available during SSR, so this read MUST happen in an
+    // effect — matches the React docs' "synchronize with external system" pattern.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (sessionStorage.getItem(STORAGE_KEY) === 'true') setAuthenticated(true);
     setHydrated(true);
   }, []);
 

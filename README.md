@@ -149,8 +149,8 @@ clinicalrounds/
 │   │   ├── synthesize/       # Attending synthesis (streaming)
 │   │   ├── additional-data/  # Re-analysis with user-provided answers
 │   │   └── health/           # Health check endpoint
-│   ├── landing/              # Landing page
-│   └── page.tsx              # Main application (client component)
+│   ├── app/                  # Gated case-review tool (PasscodeGate + workflow)
+│   └── page.tsx              # Public hero / landing page
 ├── components/               # React components
 │   ├── ConferenceView.tsx    # Main case review interface
 │   ├── SpecialistGrid.tsx    # Real-time specialist analysis cards

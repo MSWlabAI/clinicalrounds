@@ -40,6 +40,7 @@ const initialState: CaseState = {
   step: 'idle',
   rawNotes: '',
   intakeData: null,
+  parseReport: null,
   specialistAnalyses: {},
   specialistStatuses: {},
   crossConsultMessages: [],
@@ -58,6 +59,7 @@ const initialState: CaseState = {
   error: null,
   webSearchEnabled: false,
   searchActivities: [],
+  calculationActivities: [],
 };
 
 function extractQuestions(analyses: Record<string, SpecialistAnalysis>) {
