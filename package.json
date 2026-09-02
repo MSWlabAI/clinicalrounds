@@ -33,7 +33,10 @@
     "lint": "eslint",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "dave": "node scripts/dave-scan.mjs --out .dave/out",
+    "dave:test": "node scripts/dave-selftest.mjs",
+    "dave:verify": "node scripts/dave-verify.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.74.0",

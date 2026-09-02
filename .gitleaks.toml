@@ -1,0 +1,71 @@
+# gitleaks configuration — Dave's secret scanner
+# =============================================================================
+# Picked up automatically by `gitleaks git .` (config discovery: --config, then
+# GITLEAKS_CONFIG, then GITLEAKS_CONFIG_TOML, then ./.gitleaks.toml).
+#
+# READ THIS BEFORE ADDING AN ENTRY
+# --------------------------------
+# An allowlist here makes a detector quiet. That is only ever correct when the
+# finding is provably not a secret — never because a finding is inconvenient,
+# noisy, or tedious to fix. A real credential that was committed and later
+# deleted is still leaked: it lives in every clone until it is rotated.
+#
+# Each block below records WHY the finding is not a secret, so the judgement can
+# be challenged later rather than inherited on trust. If you cannot write that
+# sentence for a new entry, the answer is `/rotate`, not an allowlist.
+#
+# Every entry here was derived from a real scan (run 31291268153, the first
+# full-history run on this repo: 28 findings, all of them false).
+
+[extend]
+useDefault = true
+
+# -----------------------------------------------------------------------------
+# 1. Security teaching material — 26 of the 28
+# -----------------------------------------------------------------------------
+# The lab ships security skills and course modules whose entire purpose is to
+# show what a leaked credential looks like. gitleaks flagged the anti-pattern
+# examples inside the documentation that teaches people not to leak secrets:
+#
+#   information-leakage/SKILL.md:65   ...?api_key=abc123def456
+#   information-leakage/SKILL.md:238  fetch(`https://api.example.com/data?key=abc123def456`)
+#   security-overview/SKILL.md:386    const apiKey = 'sk_...';        <- the BAD example
+#   csrf-protection/SKILL.md:465      curl -X POST http://localhost:3000/...
+#
+# These are illustrations, not credentials — obviously fake values against
+# example.com and localhost. They also appear at several historical paths
+# because the skills tree has been reorganised, which is why SKILL.md is matched
+# by name rather than by directory.
+#
+# Trade-off, stated plainly: a genuine secret pasted into a SKILL.md would not
+# be caught. That is accepted because these files are prose by definition, and
+# the alternative is 26 permanent critical false positives every night — which
+# would train everyone to ignore Dave, and that costs more than this gap.
+[[allowlists]]
+description = "Security skills and course docs — example/anti-pattern credentials, not real ones"
+paths = [
+  '''(^|/)SKILL\.md$''',
+  '''(^|/)\.cursor/rules/.*\.mdc$''',
+  '''(^|/)docs/security/.*\.md$''',
+  '''(^|/)docs/course/.*\.md$''',
+]
+
+# -----------------------------------------------------------------------------
+# 2. CI build placeholders — the other 2
+# -----------------------------------------------------------------------------
+# ci.yml builds without Doppler on the template repo and on forks, and Clerk's
+# <ClerkProvider> throws at prerender without a publishableKey. So the build
+# step supplies format-valid dummy keys purely so `next build` can compile and
+# prerender. The workflow says so itself, immediately above them:
+#
+#   # Fake, format-valid build-time values. NOT secrets — they let the
+#   # static build/prerender complete; runtime uses the real env.
+#
+# Scoped as tightly as the facts allow: only ci.yml, and only Clerk *test*
+# keys. Clerk production credentials are pk_live_ / sk_live_, so a real one
+# committed here still fires — which is the case that actually matters.
+[[allowlists]]
+description = "ci.yml prerender placeholders — Clerk TEST keys, never valid at runtime"
+paths = ['''(^|/)\.github/workflows/ci\.yml$''']
+regexes = ['''(pk|sk)_test_[A-Za-z0-9]+''']
+regexTarget = "line"
