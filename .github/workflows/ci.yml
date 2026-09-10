@@ -2,9 +2,24 @@ name: CI
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, staging]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.dave/**'
   pull_request:
-    branches: [main]
+    branches: [main, staging]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.dave/**'
+
+# One run per ref. Superseded runs on feature/PR refs are cancelled; runs on
+# main and staging are never cancelled because the Gboard daemon waits on the
+# exact staging SHA it pushed and the production gate reads main's checks.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/staging' }}
 
 permissions:
   contents: read
