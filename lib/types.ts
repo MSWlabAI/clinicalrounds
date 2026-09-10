@@ -228,6 +228,7 @@ export interface CaseState {
   step: 'idle' | 'parsing' | 'analyzing' | 'cross_consulting' | 'synthesizing' | 'complete' | 'discussion_paused' | 'chatting';
   rawNotes: string;
   intakeData: IntakeData | null;
+  parseReport: ParseReport | null;
   specialistAnalyses: Record<string, SpecialistAnalysis>;
   specialistStatuses: Record<string, AnalysisStatus>;
   crossConsultMessages: CrossConsultMessage[];
@@ -247,6 +248,50 @@ export interface CaseState {
   webSearchEnabled: boolean;
   searchActivities: SpecialistSearchActivity[];
   calculationActivities: SpecialistCalculationActivity[];
+}
+
+// ─── Parse Stage Types ──────────────────────────────────────────────────────
+// Universal note intake — clean and structure raw Epic copy-paste before
+// the 9-specialist pipeline runs. See /lib/parse/ and /docs/parsing.md.
+
+export type SectionKey =
+  | 'chief_complaint'
+  | 'hpi'
+  | 'pmh'
+  | 'psh'
+  | 'medications'
+  | 'allergies'
+  | 'social_history'
+  | 'family_history'
+  | 'vitals'
+  | 'physical_exam'
+  | 'labs'
+  | 'imaging'
+  | 'assessment_plan'
+  | 'other';
+
+export type ParseConfidence = 'high' | 'medium' | 'low';
+
+export type ParserProvider = 'anthropic' | 'mistral' | 'none';
+
+export interface ParseCleaningReport {
+  charsStripped: number;
+  quotesFolded: number;
+  pageBreaksRemoved: number;
+  sectionsFound: number;
+  usedLLM: boolean;
+  parserProvider: ParserProvider;
+  truncated?: boolean;
+  latencyMs?: number;
+}
+
+export interface ParsedClinicalNote {
+  raw: string;
+  normalized: string;
+  sections: Partial<Record<SectionKey, string>>;
+  warnings: string[];
+  confidence: ParseConfidence;
+  cleaningReport: ParseCleaningReport;
 }
 
 // API request/response types
@@ -291,7 +336,21 @@ export interface SynthesizeRequest {
 
 // SSE event types for streaming pipeline progress
 
+export interface ParseReport {
+  confidence: ParseConfidence;
+  sectionsFound: number;
+  usedLLM: boolean;
+  parserProvider: ParserProvider;
+  charsStripped: number;
+  quotesFolded: number;
+  pageBreaksRemoved: number;
+  truncated?: boolean;
+  latencyMs?: number;
+  warnings: string[];
+}
+
 export type AnalyzeSSEEvent =
+  | { type: 'parse_complete'; parseReport: ParseReport }
   | { type: 'intake_complete'; intakeData: IntakeData; sanitizationWarnings?: string[] }
   | { type: 'triage_complete'; selectedSpecialists: Specialist[]; skippedSpecialists: Specialist[]; reasoning: string }
   | { type: 'specialist_complete'; specialist: Specialist; analysis: SpecialistAnalysis; discussionMessage: DiscussionMessage }

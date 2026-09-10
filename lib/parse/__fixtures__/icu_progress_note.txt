@@ -1,0 +1,39 @@
+ICU Progress Note — Hospital Day 4
+
+Subjective: Patient remains intubated and sedated. Family at bedside.
+
+Objective:
+Vitals (24 hr): T max 38.2, HR 88-110, BP 102-128/55-72 on norepi 0.08 mcg/kg/min,
+RR 18 (vent), SpO2 94-98% on FiO2 50% PEEP 8.
+
+Vent settings: AC/VC, TV 420, RR 18, FiO2 50%, PEEP 8. Plateau 24, peak 32.
+
+Exam: Sedated, RASS -2. Heart RRR no murmur. Lungs coarse breath sounds bilat,
+no wheeze. Abd soft, +BS. Ext warm, no edema.
+
+Labs today:
+WBC 12.4 (down from 18 yesterday)
+Hgb 9.2  Plt 145
+Lactate 1.8 (down from 4.2 admission)
+Cr 1.1 (improving from 2.0)
+ABG: 7.38 / 42 / 88 / 26
+
+Cultures:
+- Blood x2 day 1: Klebsiella pneumoniae (R to ceftriaxone, S to mero)
+- BAL day 2: same Klebsiella, ESBL-positive
+
+Imaging: Daily CXR — improving bilateral infiltrates, ETT in good position.
+
+Assessment / Plan:
+1. Septic shock from Klebsiella pneumonia — improving. Pressor weaning.
+   Continue meropenem, day 4 of 14.
+2. Acute hypoxic respiratory failure on mechanical ventilation. Plan SBT
+   tomorrow if FiO2 ≤ 40%.
+3. AKI resolved. Continue to monitor.
+4. Sedation: Reducing propofol, target RASS -1 to 0 for SAT/SBT.
+5. DVT prophylaxis with heparin SQ, continued.
+6. Stress ulcer prophylaxis with pantoprazole.
+7. Nutrition: Tube feeds at goal, 60 mL/hr.
+8. FEN: Continue maintenance fluids.
+
+Discussed with family. Critical condition. Code: Full.

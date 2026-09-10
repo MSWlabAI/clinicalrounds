@@ -1,6 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { Specialist, SPECIALIST_CONFIG } from './types';
-import type { IntakeData, SpecialistAnalysis, CrossConsultMessage, CrossConsultRound, TemporalIntakeData, SpecialistChatMessage, WebSearchCitation, SpecialistCalculationActivity } from './types';
+import type { IntakeData, SpecialistAnalysis, CrossConsultMessage, CrossConsultRound, TemporalIntakeData, SpecialistChatMessage, WebSearchCitation, SpecialistCalculationActivity, ParsedClinicalNote } from './types';
+import { parseClinicalNote, renderSectionsBlock } from './parse';
 import { INTAKE_PARSER_PROMPT } from './prompts/intake-parser';
 import { ATTENDING_PROMPT } from './prompts/attending';
 import { CARDIOLOGIST_PROMPT } from './prompts/cardiologist';
@@ -272,9 +273,23 @@ function extractJSON(text: string): string | null {
 export async function runIntake(rawText: string): Promise<{
   intakeData: TemporalIntakeData;
   sanitizationWarnings: string[];
+  parsedNote: ParsedClinicalNote;
 }> {
-  // Sanitize the raw text before sending to the parser
-  const { cleaned, warnings } = sanitizeChartText(rawText);
+  // Step 0: ParseStage — universal note intake. Cleans Epic copy-paste
+  // artifacts (smart quotes, page breaks, control chars), regex-detects
+  // canonical sections, and (when needed) re-segments via Claude Haiku.
+  const parsedNote = await parseClinicalNote(rawText);
+  if (parsedNote.warnings.length > 0) {
+    console.log(`[parse] Warnings:\n  - ${parsedNote.warnings.join('\n  - ')}`);
+  }
+  console.log(
+    `[parse] confidence=${parsedNote.confidence} sectionsFound=${parsedNote.cleaningReport.sectionsFound} ` +
+    `usedLLM=${parsedNote.cleaningReport.usedLLM} latency=${parsedNote.cleaningReport.latencyMs}ms`,
+  );
+
+  // Step 0b: defensive sanitizer — strips RTF / base64 / HTML residue
+  // that the deterministic normalizer leaves in place.
+  const { cleaned, warnings } = sanitizeChartText(parsedNote.normalized);
 
   if (warnings.length > 0) {
     console.log(`[intake] Sanitization warnings:\n  - ${warnings.join('\n  - ')}`);
@@ -286,12 +301,19 @@ export async function runIntake(rawText: string): Promise<{
 
   console.log(`[intake] Parsing ${cleaned.length} chars (original: ${rawText.length} chars)`);
 
+  // When ParseStage found canonical sections, prepend a structured block
+  // so the intake LLM has an unambiguous segmentation to work from.
+  const sectionsBlock = renderSectionsBlock(parsedNote.sections);
+  const intakeInput = sectionsBlock
+    ? `# STRUCTURED SECTIONS (verbatim from chart)\n${sectionsBlock}\n\n# RAW NORMALIZED TEXT\n${cleaned}`
+    : cleaned;
+
   const response = await anthropic.messages.create({
     model: SONNET_MODEL,
     max_tokens: 16384,
     system: INTAKE_PARSER_PROMPT,
     messages: [
-      { role: 'user', content: cleaned },
+      { role: 'user', content: intakeInput },
       { role: 'assistant', content: '{' },
     ],
   });
@@ -332,7 +354,7 @@ export async function runIntake(rawText: string): Promise<{
     `${parsed.labs?.length || 0} labs, ${parsed.imaging?.length || 0} imaging, ` +
     `${parsed.encounters?.length || 0} encounters`);
 
-  return { intakeData: parsed, sanitizationWarnings: warnings };
+  return { intakeData: parsed, sanitizationWarnings: warnings, parsedNote };
 }
 
 export async function runIncrementalIntake(
@@ -404,10 +426,13 @@ interface SpecialistToolOptions {
   webSearchEnabled?: boolean;
   onSearch?: (specialist: string, query: string) => void;
   onCalculation?: (specialist: string, code: string) => void;
+  // Optional ParseStage output. When provided, specialists receive the
+  // verbatim section block in addition to the structured intake JSON.
+  parsedNote?: ParsedClinicalNote;
 }
 
-function buildToolsArray(options?: SpecialistToolOptions): any[] {
-  const tools: any[] = [CODE_EXECUTION_TOOL];
+function buildToolsArray(options?: SpecialistToolOptions): unknown[] {
+  const tools: unknown[] = [CODE_EXECUTION_TOOL];
   if (options?.webSearchEnabled) {
     tools.push(WEB_SEARCH_TOOL);
   }
@@ -422,6 +447,16 @@ async function runSingleSpecialist(
   const config = SPECIALIST_CONFIG[specialist];
   const model = config.model === 'opus' ? OPUS_MODEL : SONNET_MODEL;
 
+  // Prepend a verbatim section block when ParseStage was able to detect
+  // canonical sections. Falls back silently to the structured JSON only.
+  const parsedNote = options?.parsedNote;
+  const sectionsBlock = parsedNote
+    ? renderSectionsBlock(parsedNote.sections)
+    : '';
+  const noteContext = sectionsBlock
+    ? `## Verbatim chart sections (preserved from source)\n${sectionsBlock}\n\n## Structured intake data\n${JSON.stringify(intakeData, null, 2)}`
+    : `${JSON.stringify(intakeData, null, 2)}`;
+
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const createParams: any = {
     model,
@@ -429,11 +464,12 @@ async function runSingleSpecialist(
     system: SPECIALIST_PROMPTS[specialist],
     messages: [{
       role: 'user',
-      content: `Analyze the following patient data:\n\n${JSON.stringify(intakeData, null, 2)}`,
+      content: `Analyze the following patient data:\n\n${noteContext}`,
     }],
   };
 
   createParams.tools = buildToolsArray(options);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const response = await (anthropic.beta.messages.create as any)({
     ...createParams,
     betas: ['code-execution-2025-05-22'],
@@ -475,8 +511,12 @@ async function runSingleSpecialist(
         options.onCalculation(specialist, input.code);
       }
     } else if (block.type === 'code_execution_tool_result') {
-      const content = (block as any).content;
-      const code = pendingCodeExecution.get((block as any).tool_use_id) || '';
+      const result = block as unknown as {
+        content?: { type?: string; stdout?: string; return_code?: number };
+        tool_use_id?: string;
+      };
+      const content = result.content;
+      const code = pendingCodeExecution.get(result.tool_use_id ?? '') || '';
       if (content?.type === 'code_execution_result') {
         calculations.push({
           specialist,
@@ -982,7 +1022,7 @@ function condenseSynthesisInput(
     demographics: intakeData.demographics,
     chief_complaint: intakeData.chief_complaint,
     hpi: intakeData.hpi,
-    active_problems: (intakeData as any).active_problems,
+    active_problems: (intakeData as { active_problems?: unknown }).active_problems,
     medications: intakeData.medications,
     vitals: intakeData.vitals,
     labs: intakeData.labs,
@@ -1003,7 +1043,8 @@ function condenseSynthesisInput(
           return s;
         }).join('; ')}`);
       }
-      if ((analysis as any).evidence_basis) parts.push(`Evidence: ${(analysis as any).evidence_basis}`);
+      const evidenceBasis = (analysis as { evidence_basis?: string }).evidence_basis;
+      if (evidenceBasis) parts.push(`Evidence: ${evidenceBasis}`);
       return parts.join('\n');
     })
     .join('\n\n');

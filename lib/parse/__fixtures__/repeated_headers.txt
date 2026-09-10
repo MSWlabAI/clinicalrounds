@@ -1,0 +1,57 @@
+EPIC SHARED MEDICAL RECORD - CONFIDENTIAL
+Patient: REDACTED
+DOB: REDACTED
+MRN: 0000000
+
+CHIEF COMPLAINT: Generalized weakness, fall
+
+EPIC SHARED MEDICAL RECORD - CONFIDENTIAL
+Patient: REDACTED
+DOB: REDACTED
+MRN: 0000000
+
+HPI: 84 y/o F who lives alone presents after being found on the floor
+by her daughter. Last seen well 14 hrs prior. Unclear how long she was
+down. Reports new urinary urgency for 3 days, mild burning.
+
+EPIC SHARED MEDICAL RECORD - CONFIDENTIAL
+Patient: REDACTED
+DOB: REDACTED
+MRN: 0000000
+
+PMH: Atrial fibrillation on apixaban, HTN, CKD3, osteoporosis, mild dementia.
+
+EPIC SHARED MEDICAL RECORD - CONFIDENTIAL
+Patient: REDACTED
+DOB: REDACTED
+MRN: 0000000
+
+MEDICATIONS:
+- Apixaban 5 mg BID
+- Metoprolol 25 mg BID
+- Donepezil 10 mg daily
+
+ALLERGIES: Sulfa — hives
+
+VS: T 100.4 HR 96 BP 108/62 RR 20 SpO2 95% RA
+
+EXAM: Awake, oriented x2 (was x3 baseline per daughter). No lateralizing
+deficits. Mild suprapubic tenderness. No focal head trauma.
+
+LABS:
+WBC 13.8  Hgb 11.2  Plt 220
+Cr 1.6 (baseline 1.2)  Na 132  K 4.0
+UA: large LE, +nitrites, many WBC, bacteria many
+Lactate 2.4
+
+IMAGING:
+CT head: No acute intracranial process.
+CXR: No infiltrate.
+
+ASSESSMENT AND PLAN:
+1. Sepsis from UTI in elderly patient with delirium. Cultures pending.
+   Empiric ceftriaxone 1g IV.
+2. AKI on CKD likely prerenal. IVF resuscitation.
+3. Atrial fibrillation on apixaban — hold while inpatient pending fall
+   workup, restart per fall risk reassessment.
+4. Mechanical fall, found down — admit for observation, place on tele.

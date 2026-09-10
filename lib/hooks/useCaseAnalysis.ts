@@ -111,6 +111,9 @@ export function useCaseAnalysis({ dispatch, state }: UseCaseAnalysisOptions): Us
           throw new Error((event as { type: 'error'; error: string }).error);
         }
         switch (event.type) {
+          case 'parse_complete':
+            dispatch({ type: 'PARSE_COMPLETE', parseReport: event.parseReport });
+            break;
           case 'intake_complete':
             intakeData = event.intakeData;
             dispatch({ type: 'INTAKE_COMPLETE', intakeData: event.intakeData });

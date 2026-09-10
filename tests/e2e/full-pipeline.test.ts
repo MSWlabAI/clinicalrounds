@@ -237,7 +237,6 @@ describe('E2E: Full Analysis Pipeline', () => {
   describe('Synthesis Phase', () => {
     it('should stream synthesis text', async () => {
       const chunks = ['Problem 1:', ' CHF Exacerbation\n', '- IV diuresis'];
-      let index = 0;
 
       vi.mocked(runSynthesis).mockReturnValueOnce(
         (async function* () {

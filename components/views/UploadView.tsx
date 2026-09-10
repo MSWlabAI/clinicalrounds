@@ -2,16 +2,19 @@
 
 import { PasteBox } from '@/components/PasteBox';
 import { Disclaimer } from '@/components/Disclaimer';
+import { ParseStatusChip } from '@/components/ParseStatusChip';
 import { Loader2, Stethoscope, Users, Zap, Shield } from 'lucide-react';
+import type { ParseReport } from '@/lib/types';
 
 interface UploadViewProps {
   onSubmit: (rawNotes: string) => void;
   isParsing?: boolean;
   webSearchEnabled?: boolean;
   onToggleWebSearch?: (enabled: boolean) => void;
+  parseReport?: ParseReport | null;
 }
 
-export function UploadView({ onSubmit, isParsing, webSearchEnabled, onToggleWebSearch }: UploadViewProps) {
+export function UploadView({ onSubmit, isParsing, webSearchEnabled, onToggleWebSearch, parseReport }: UploadViewProps) {
   return (
     <div className="mx-auto max-w-2xl animate-fade-in-up">
       {/* Hero Section */}
@@ -55,9 +58,20 @@ export function UploadView({ onSubmit, isParsing, webSearchEnabled, onToggleWebS
               <Loader2 className="size-6 animate-spin text-primary" aria-hidden="true" />
             </div>
             <div className="text-center">
-              <p className="text-sm font-medium">Parsing clinical notes...</p>
-              <p className="text-xs text-muted-foreground mt-1">Extracting structured data from your notes</p>
+              <p className="text-sm font-medium">
+                {parseReport ? 'Parsing clinical notes…' : 'Preparing notes…'}
+              </p>
+              <p className="text-xs text-muted-foreground mt-1">
+                {parseReport
+                  ? 'Extracting structured data from your notes'
+                  : 'Cleaning Epic copy-paste artifacts and detecting sections'}
+              </p>
             </div>
+            {parseReport && (
+              <div className="w-full max-w-md mt-2">
+                <ParseStatusChip parseReport={parseReport} />
+              </div>
+            )}
           </div>
         ) : (
           <PasteBox

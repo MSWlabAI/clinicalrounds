@@ -15,6 +15,8 @@ from a team of 9 AI specialist agents that reason collaboratively.
 - Opus for final synthesis, Sonnet for all specialists.
 
 ## Key Files
+- /app/page.tsx — Public hero / landing page (no PasscodeGate).
+- /app/app/page.tsx — Gated case-review tool (wraps PasscodeGate + workflow).
 - /lib/prompts/ — System prompts for each specialist. These are
   LARGE and contain embedded clinical expertise. Do not simplify them.
 - /lib/orchestrator.ts — Core logic for managing the multi-agent flow.

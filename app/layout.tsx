@@ -2,6 +2,7 @@ import type { Metadata } from 'next';
 import { Geist, Geist_Mono } from 'next/font/google';
 import { AnalyticsProvider } from '@/components/AnalyticsProvider';
 import { Disclaimer } from '@/components/Disclaimer';
+import { APP_VERSION } from '@/lib/version';
 import './globals.css';
 
 const geistSans = Geist({
@@ -29,7 +30,10 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <div className="flex min-h-screen flex-col">
           <main className="flex-1">{children}</main>
           <footer className="border-t border-border">
-            <Disclaimer />
+            <div className="flex items-center justify-between px-4 py-2">
+              <Disclaimer />
+              <span className="text-xs text-muted-foreground">{APP_VERSION}</span>
+            </div>
           </footer>
         </div>
         <AnalyticsProvider />

@@ -5,8 +5,9 @@ import { SpecialistGrid } from '@/components/SpecialistGrid';
 import { ScoringSystemsSidebar } from '@/components/ScoringSystemsSidebar';
 import { ActivityFeed } from '@/components/ActivityFeed';
 import { TeamDiscussion } from '@/components/TeamDiscussion';
+import { ParseStatusChip } from '@/components/ParseStatusChip';
 import { Users } from 'lucide-react';
-import type { SpecialistAnalysis, AnalysisStatus, ScoringSystem, DiscussionMessage, SpecialistSearchActivity, SpecialistCalculationActivity } from '@/lib/types';
+import type { SpecialistAnalysis, AnalysisStatus, ScoringSystem, DiscussionMessage, SpecialistSearchActivity, SpecialistCalculationActivity, ParseReport } from '@/lib/types';
 
 interface AnalysisViewProps {
   specialistAnalyses: Record<string, SpecialistAnalysis>;
@@ -16,6 +17,7 @@ interface AnalysisViewProps {
   isAnalyzing: boolean;
   searchActivities?: SpecialistSearchActivity[];
   calculationActivities?: SpecialistCalculationActivity[];
+  parseReport?: ParseReport | null;
 }
 
 export function AnalysisView({
@@ -26,6 +28,7 @@ export function AnalysisView({
   isAnalyzing,
   searchActivities,
   calculationActivities,
+  parseReport,
 }: AnalysisViewProps) {
   const hasAnalyses = Object.keys(specialistAnalyses).length > 0;
   const hasStatuses = Object.keys(specialistStatuses).length > 0;
@@ -39,6 +42,9 @@ export function AnalysisView({
 
   useEffect(() => {
     if (!isAnalyzing) return;
+    // Reset timer at the start of each analysis run. The increment below runs
+    // inside an interval callback, not synchronously, so it isn't flagged.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setElapsed(0);
     const interval = setInterval(() => {
       setElapsed(prev => prev + 1);
@@ -56,6 +62,11 @@ export function AnalysisView({
     <div className="grid gap-6 lg:grid-cols-[1fr_320px] animate-fade-in-up">
       {/* Main Column */}
       <div className="space-y-6 min-w-0">
+        {/* Parse status (preserved across the analysis) */}
+        {parseReport && (
+          <ParseStatusChip parseReport={parseReport} />
+        )}
+
         {/* Phase Banner */}
         {isAnalyzing && (
           <div className="gradient-hero rounded-xl px-5 py-4 animate-fade-in">

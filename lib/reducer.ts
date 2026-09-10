@@ -18,6 +18,7 @@ import type {
   SpecialistChatMessage,
   DiscussionPauseState,
   UserSteeringAction,
+  ParseReport,
 } from '@/lib/types';
 import { Specialist } from '@/lib/types';
 
@@ -106,6 +107,7 @@ export type Action =
   | { type: 'SET_PARSING' }
   | { type: 'SET_ANALYZING'; statuses: Record<string, AnalysisStatus> }
   | { type: 'INTAKE_COMPLETE'; intakeData: IntakeData }
+  | { type: 'PARSE_COMPLETE'; parseReport: ParseReport }
   | { type: 'SPECIALIST_COMPLETE'; specialist: string; analysis: SpecialistAnalysis; discussionMessage: DiscussionMessage }
   | { type: 'SPECIALIST_ERROR'; specialist: string; error: string }
   | { type: 'ANALYZE_DONE' }
@@ -149,6 +151,7 @@ export const initialState: CaseState = {
   step: 'idle',
   rawNotes: '',
   intakeData: null,
+  parseReport: null,
   specialistAnalyses: {},
   specialistStatuses: {},
   crossConsultMessages: [],
@@ -193,6 +196,9 @@ export function caseReducer(state: CaseState, action: Action): CaseState {
 
     case 'INTAKE_COMPLETE':
       return { ...state, intakeData: action.intakeData };
+
+    case 'PARSE_COMPLETE':
+      return { ...state, parseReport: action.parseReport };
 
     case 'TRIAGE_COMPLETE': {
       // Update specialist statuses: selected ones are 'analyzing', skipped ones are removed

@@ -26,8 +26,28 @@ export async function POST(request: NextRequest) {
       }
 
       try {
-        // Step 1: Parse raw notes into structured intake data (with sanitization)
-        const { intakeData, sanitizationWarnings } = await runIntake(body.rawNotes);
+        // Step 1: Parse raw notes into structured intake data (with ParseStage + sanitization)
+        const { intakeData, sanitizationWarnings, parsedNote } = await runIntake(body.rawNotes);
+
+        // Surface ParseStage telemetry to the UI before intake_complete so
+        // the user sees a confidence chip and any "couldn't fully structure"
+        // banner without waiting for the rest of the pipeline.
+        send({
+          type: 'parse_complete',
+          parseReport: {
+            confidence: parsedNote.confidence,
+            sectionsFound: parsedNote.cleaningReport.sectionsFound,
+            usedLLM: parsedNote.cleaningReport.usedLLM,
+            parserProvider: parsedNote.cleaningReport.parserProvider,
+            charsStripped: parsedNote.cleaningReport.charsStripped,
+            quotesFolded: parsedNote.cleaningReport.quotesFolded,
+            pageBreaksRemoved: parsedNote.cleaningReport.pageBreaksRemoved,
+            truncated: parsedNote.cleaningReport.truncated,
+            latencyMs: parsedNote.cleaningReport.latencyMs,
+            warnings: parsedNote.warnings,
+          },
+        });
+
         send({
           type: 'intake_complete',
           intakeData,
@@ -86,8 +106,9 @@ export async function POST(request: NextRequest) {
               send({ type: 'specialist_search', specialist, query });
             },
             onCalculation: (specialist, code) => {
-              send({ type: 'specialist_calculation', specialist, code } as any);
+              send({ type: 'specialist_calculation', specialist, code } as unknown as AnalyzeSSEEvent);
             },
+            parsedNote,
           },
           selectedSpecialists
         );
